@@ -24,10 +24,10 @@ import sqlalchemy as s
 import pandas as pd
 from pathlib import Path
 from urllib.parse import urlparse, quote
-from sqlalchemy.ext.automap import automap_base
 from augur.config import AugurConfig
 from augur.logging import AugurLogging
 from sqlalchemy.sql.expression import bindparam
+from sqlalchemy.ext.automap import automap_base
 from concurrent import futures
 import dask.dataframe as dd
 
@@ -38,27 +38,26 @@ import dask.dataframe as dd
 #1. Base
 #2. Github/lab 
 # Might be good to seperate the machine learning functionality into its own class too.
+from augur.platform_connector import PlatformConnector
 
-class Worker():
-
-    ROOT_AUGUR_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+class Worker(PlatformConnector):
 
     ## Set Thread Safety for OSX
     # os.system("./osx-thread.sh")
 
     #Might cut down on these args to create subclasses
-    def __init__(self, worker_type, config={}, given=[], models=[], data_tables=[], operations_tables=[]):
+    def __init__(self, worker_type, config={}, given=[], models=[], data_tables=[], operations_tables=[], db=None, helper_db=None, platform="github"):
+
+        # PlatformConnector.__init__(config, given, data_tables, operations_tables, platform)
+        super(Worker, self).__init__(config, given, data_tables, operations_tables, db, helper_db, platform)
 
         self.worker_type = worker_type
         self.collection_start_time = None
+
         self._task = None # task currently being worked on (dict)
+        self.worker_type = worker_type
         self._child = None # process of currently running task (multiprocessing process)
         self._queue = Queue() # tasks stored here 1 at a time (in a mp queue so it can translate across multiple processes)
-        #These are for the database section
-        self.data_tables = data_tables
-        self.operations_tables = operations_tables
-
-        self._root_augur_dir = Worker.ROOT_AUGUR_DIR
 
         # count of tuples inserted in the database (to store stats for each task in op tables) 
         self.update_counter = 0
@@ -67,8 +66,6 @@ class Worker():
 
         # if we are finishing a previous task, certain operations work differently
         self.finishing_task = False
-        # Update config with options that are general and not specific to any worker
-        self.augur_config = AugurConfig(self._root_augur_dir)
 
         #TODO: consider taking parts of this out for the base class and then overriding it in WorkerGitInterfaceable
         self.config = {
@@ -78,7 +75,6 @@ class Worker():
                 #'gitlab_api_key': self.augur_config.get_value('Database', 'gitlab_api_key'),
                 'offline_mode': False
             }
-        self.config.update(self.augur_config.get_section("Logging"))
 
         try:
             worker_defaults = self.augur_config.get_default_config()['Workers'][self.config['worker_type']]
@@ -109,11 +105,6 @@ class Worker():
             'location': 'http://{}:{}'.format(self.config['host'], worker_port),
             'port_broker': self.augur_config.get_value('Server', 'port'),
             'host_broker': self.augur_config.get_value('Server', 'host'),
-            'host_database': self.augur_config.get_value('Database', 'host'),
-            'port_database': self.augur_config.get_value('Database', 'port'),
-            'user_database': self.augur_config.get_value('Database', 'user'),
-            'name_database': self.augur_config.get_value('Database', 'name'),
-            'password_database': self.augur_config.get_value('Database', 'password')
         })
         self.config.update(config)
 
@@ -176,12 +167,17 @@ class Worker():
                  json.dump(data, f)
 
     def initialize_logging(self):
+
         #Get the log level in upper case from the augur config's logging section.
+
         self.config['log_level'] = self.config['log_level'].upper()
         if self.config['debug']:
             self.config['log_level'] = 'DEBUG'
 
-        if self.config['verbose']:
+        super(Worker, self).initialize_logging()
+
+        if "verbose" in self.config and self.config["verbose"]:
+
             format_string = AugurLogging.verbose_format_string
         else:
             format_string = AugurLogging.simple_format_string
@@ -222,14 +218,14 @@ class Worker():
         logger.setLevel(self.config['log_level'])
         logger.propagate = False
 
-        if self.config['debug']:
-            self.config['log_level'] = 'DEBUG'
+        if "debug" in self.config and self.config["debug"]:
+            self.config["log_level"] = "DEBUG"
             console_handler = StreamHandler()
             console_handler.setFormatter(formatter)
             console_handler.setLevel(self.config['log_level'])
             logger.addHandler(console_handler)
 
-        if self.config['quiet']:
+        if "quiet" in self.config and self.config["quiet"]:
             logger.disabled = True
 
         self.logger = logger
@@ -281,6 +277,28 @@ class Worker():
 
         # Increment so we are ready to insert the 'next one' of each of these most recent ids
         self.history_id = self.get_max_id('worker_history', 'history_id', operations_table=True) + 1
+
+    def check_duplicates(self, new_data, table_values, key):
+        """ Filters what items of the new_data json (list of dictionaries) that are not
+        present in the table_values df
+
+        :param new_data: List of dictionaries, new data to filter duplicates out of
+        :param table_values: Pandas DataFrame, existing data to check what data is already
+            present in the database
+        :param key: String, key of each dict in new_data whose value we are checking
+            duplicates with
+        :return: List of dictionaries, contains elements of new_data that are not already
+            present in the database
+        """
+        need_insertion = []
+        for obj in new_data:
+            if type(obj) != dict:
+                continue
+            if not table_values.isin([obj[key]]).any().any():
+                need_insertion.append(obj)
+        self.logger.info("Page recieved has {} tuples, while filtering duplicates this ".format(str(len(new_data))) +
+            "was reduced to {} tuples.\n".format(str(len(need_insertion))))
+        return need_insertion
 
     @property
     def results_counter(self):
@@ -753,28 +771,6 @@ class Worker():
             "was reduced to {} tuples, and {} tuple updates are needed.\n".format(need_insertion_count, need_update_count))
         return new_data
 
-    def check_duplicates(self, new_data, table_values, key):
-        """ Filters what items of the new_data json (list of dictionaries) that are not
-        present in the table_values df
-
-        :param new_data: List of dictionaries, new data to filter duplicates out of
-        :param table_values: Pandas DataFrame, existing data to check what data is already
-            present in the database
-        :param key: String, key of each dict in new_data whose value we are checking
-            duplicates with
-        :return: List of dictionaries, contains elements of new_data that are not already
-            present in the database
-        """
-        need_insertion = []
-        for obj in new_data:
-            if type(obj) != dict:
-                continue
-            if not table_values.isin([obj[key]]).any().any():
-                need_insertion.append(obj)
-        self.logger.info("Page recieved has {} tuples, while filtering duplicates this ".format(str(len(new_data))) +
-            "was reduced to {} tuples.\n".format(str(len(need_insertion))))
-        return need_insertion
-
     def connect_to_broker(self):
         connected = False
         for i in range(5):
@@ -782,6 +778,7 @@ class Worker():
                 self.logger.debug("Connecting to broker, attempt {}\n".format(i))
                 if i > 0:
                     time.sleep(10)
+                self.logger.info("broker & port: "+self.config['host_broker']+"  "+self.config['port_broker'])
                 requests.post('http://{}:{}/api/unstable/workers'.format(
                     self.config['host_broker'],self.config['port_broker']), json=self.specs)
                 self.logger.info("Connection to the broker was successful\n")
@@ -791,34 +788,6 @@ class Worker():
                 self.logger.error('Cannot connect to the broker. Trying again...\n')
         if not connected:
             sys.exit('Could not connect to the broker after 5 attempts! Quitting...\n')
-
-    @staticmethod
-    def dump_queue(queue):
-        """ Empties all pending items in a queue and returns them in a list.
-        """
-        result = []
-        queue.put("STOP")
-        for i in iter(queue.get, 'STOP'):
-            result.append(i)
-        # time.sleep(.1)
-        return result
-
-    #doesn't even query the api just gets it based on the url string, can stay in base
-    def get_owner_repo(self, git_url):
-        """ Gets the owner and repository names of a repository from a git url
-
-        :param git_url: String, the git url of a repository
-        :return: Tuple, includes the owner and repository names in that order
-        """
-        split = git_url.split('/')
-
-        owner = split[-2]
-        repo = split[-1]
-
-        if '.git' == repo[-4:]:
-            repo = repo[:-4]
-
-        return owner, repo
 
     def get_max_id(self, table, column, default=25150, operations_table=False):
         """ Gets the max value (usually used for id/pk's) of any Integer column
@@ -879,6 +848,16 @@ class Worker():
         values = pd.read_sql(table_values_sql, self.db, params={})
         return values
 
+    @staticmethod
+    def dump_queue(queue):
+        """ Empties all pending items in a queue and returns them in a list.
+        """
+        result = []
+        queue.put("STOP")
+        for i in iter(queue.get, 'STOP'):
+            result.append(i)
+        # time.sleep(.1)
+        return result
 
     def bulk_insert(
         self, table, insert=[], update=[], unique_columns=[], update_columns=[],
@@ -903,10 +882,6 @@ class Worker():
         self.logger.info(
             f"{len(insert)} insertions are needed and {len(update)} "
             f"updates are needed for {table}"
-        )
-
-        update_result = None
-        insert_result = None
 
         if len(update) > 0:
             attempts = 0
